@@ -8,6 +8,7 @@ See [phpPgAdmin Wiki page on Neard](https://github.com/crazy-max/neard/wiki/appP
 
 * http://phppgadmin.sourceforge.net
 * https://github.com/phppgadmin/phppgadmin
+* https://github.com/Tomicapo/phppgadmin
 
 ## Issues
 
