@@ -1,7 +1,5 @@
 # Changelog
 
-### [Check compatibility with Neard](https://github.com/crazy-max/neard/wiki/appPhpPgAdmin#latest) before downloading.
-
 ## r2 (2016/10/12)
 
 * New bundle 5.2 retrieved from [Tomicapo/phppgadmin](https://github.com/Tomicapo/phppgadmin) repository for PHP 7 compatibility.
