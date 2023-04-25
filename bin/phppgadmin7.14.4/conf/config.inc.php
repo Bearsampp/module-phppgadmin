@@ -21,7 +21,7 @@ $conf['servers'][0]['desc'] = 'PostgreSQL port ' . $postgresqlPort;
 
 // Hostname or IP address for server.  Use '' for UNIX domain socket.
 // use 'localhost' for TCP/IP connection on this computer
-$conf['servers'][0]['host'] = '127.0.0.1';
+$conf['servers'][0]['host'] = 'localhost';
 
 // Database port on server (5432 is the PostgreSQL default)
 $conf['servers'][0]['port'] = $postgresqlPort;
@@ -34,7 +34,7 @@ $conf['servers'][0]['sslmode'] = 'allow';
 
 // Change the default database only if you cannot connect to template1.
 // For a PostgreSQL 8.1+ server, you can set this to 'postgres'.
-$conf['servers'][0]['defaultdb'] = 'postgres';
+$conf['servers'][0]['defaultdb'] = 'template1';
 
 // Specify the path to the database dump utilities for this server.
 // You can set these to '' if no dumper is available.
@@ -59,7 +59,7 @@ $conf['servers'][0]['pg_dumpall_path'] = $postgresqlDumpAllExe;
  */
 //$conf['srv_groups'][0]['desc'] = 'group one';
 
-/* Add here servers indexes belonging to the group '0' seperated by comma */
+/* Add here servers indexes belonging to the group '0' separated by comma */
 //$conf['srv_groups'][0]['servers'] = '0,1,2';
 
 /* A server can belong to multi groups. Here server 1 is referenced in both
@@ -110,6 +110,9 @@ $conf['autocomplete'] = 'default on';
 // passworded local connections.
 $conf['extra_login_security'] = false;
 
+// Required by pgadmin2
+$conf['extra_session_security'] = false;
+
 // Only show owned databases?
 // Note: This will simply hide other databases in the list - this does
 // not in any way prevent your users from seeing other database by
@@ -139,6 +142,7 @@ $conf['left_width'] = 200;
 $conf['theme'] = 'default';
 
 // Show OIDs when browsing tables?
+// Only supported in versions <=11
 $conf['show_oids'] = false;
 
 // Max rows to show on a page when browsing record sets
