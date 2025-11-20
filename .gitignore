@@ -13,10 +13,5 @@
 # ignore "current" directories
 /**/current
 
-# Gradle
-/.gradle
-/build
-/.gradle/build-cache
-
 # Qodo
 /.qodo
