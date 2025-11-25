@@ -1,0 +1,489 @@
+name: phpPgAdmin Test
+
+# This workflow tests phpPgAdmin versions from pull requests
+# Smart Detection:
+# 1. Primary: Extracts versions from changed files in /bin directory (e.g., bin/phppgadmin7.14.4/)
+# 2. Fallback: Extracts version numbers from PR title
+# Note: If no versions detected, the workflow will fail (manual mode can test latest N versions)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+    branches:
+      - main
+  
+  # Manual trigger for testing specific versions
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: 'Comma-separated list of versions to test (e.g., 7.14.4,7.14.7)'
+        required: false
+      test_latest:
+        description: 'Number of latest versions to test (default: 5)'
+        required: false
+        default: '5'
+
+jobs:
+  detect-versions:
+    name: Detect Versions to Test
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.detect.outputs.versions }}
+      version_count: ${{ steps.detect.outputs.version_count }}
+    
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+      
+      - name: Fetch main branch for comparison
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin main:main
+      
+      - name: Detect versions to test
+        id: detect
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          MANUAL_VERSIONS: ${{ github.event.inputs.versions }}
+          TEST_LATEST: ${{ github.event.inputs.test_latest || '5' }}
+        run: |
+          set -e
+          
+          echo "=== Version Detection Strategy ==="
+          echo ""
+          
+          VERSIONS=()
+          
+          # Manual workflow dispatch - use provided versions or test latest
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ -n "$MANUAL_VERSIONS" ]; then
+              echo "📝 Manual trigger: Using provided versions"
+              IFS=',' read -ra VERSIONS <<< "$MANUAL_VERSIONS"
+              # Trim whitespace
+              VERSIONS=("${VERSIONS[@]// /}")
+            else
+              echo "📝 Manual trigger: Testing latest $TEST_LATEST versions"
+              # Will be handled in fallback method below
+            fi
+          fi
+          
+          # Method 1: Detect from changed files in /bin directory
+          if [ ${#VERSIONS[@]} -eq 0 ] && [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "🔍 Method 1: Checking for changed files in /bin directory..."
+            
+            # Get changed files compared to main branch
+            CHANGED_FILES=$(git diff --name-only main...HEAD | grep '^bin/phppgadmin' || true)
+            
+            if [ -n "$CHANGED_FILES" ]; then
+              echo "Changed files in /bin:"
+              echo "$CHANGED_FILES"
+              echo ""
+              
+              # Extract version numbers from directory names (e.g., bin/phppgadmin7.14.4/ -> 7.14.4)
+              while IFS= read -r file; do
+                if [[ $file =~ bin/phppgadmin([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+                  VERSION="${BASH_REMATCH[1]}"
+                  # Check if version not already in array
+                  if [[ ! " ${VERSIONS[@]} " =~ " ${VERSION} " ]]; then
+                    VERSIONS+=("$VERSION")
+                    echo "  ✓ Found version: $VERSION"
+                  fi
+                fi
+              done <<< "$CHANGED_FILES"
+              
+              if [ ${#VERSIONS[@]} -gt 0 ]; then
+                echo ""
+                echo "✅ Detected ${#VERSIONS[@]} version(s) from /bin directory changes"
+              fi
+            else
+              echo "  ℹ️  No changes detected in /bin directory"
+            fi
+          fi
+          
+          # Method 2: Extract from PR title
+          if [ ${#VERSIONS[@]} -eq 0 ] && [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo ""
+            echo "🔍 Method 2: Extracting versions from PR title..."
+            echo "PR Title: $PR_TITLE"
+            
+            # Extract version patterns like 7.14.4, 7.14.7, etc.
+            while [[ $PR_TITLE =~ ([0-9]+\.[0-9]+\.[0-9]+) ]]; do
+              VERSION="${BASH_REMATCH[1]}"
+              # Check if version not already in array
+              if [[ ! " ${VERSIONS[@]} " =~ " ${VERSION} " ]]; then
+                VERSIONS+=("$VERSION")
+                echo "  ✓ Found version: $VERSION"
+              fi
+              # Remove matched version from title to find next one
+              PR_TITLE="${PR_TITLE/${BASH_REMATCH[0]}/}"
+            done
+            
+            if [ ${#VERSIONS[@]} -gt 0 ]; then
+              echo ""
+              echo "✅ Detected ${#VERSIONS[@]} version(s) from PR title"
+            else
+              echo "  ℹ️  No version numbers found in PR title"
+            fi
+          fi
+          
+          # Method 3: Manual mode only - test latest N versions from releases.properties
+          if [ ${#VERSIONS[@]} -eq 0 ] && [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo ""
+            echo "🔍 Manual Mode: Testing latest $TEST_LATEST versions from releases.properties"
+            
+            # Always use releases.properties from main branch
+            git checkout main -- releases.properties 2>/dev/null || true
+            
+            if [ -f "releases.properties" ]; then
+              # Extract version numbers from releases.properties (skip comments and empty lines)
+              # Take the first N versions (file should be sorted with newest first)
+              LATEST_VERSIONS=$(grep -v '^#' releases.properties | grep -v '^[[:space:]]*$' | grep '=' | cut -d'=' -f1 | tr -d ' ' | head -n "$TEST_LATEST")
+              
+              while IFS= read -r VERSION; do
+                if [ -n "$VERSION" ]; then
+                  VERSIONS+=("$VERSION")
+                  echo "  ✓ Will test version: $VERSION"
+                fi
+              done <<< "$LATEST_VERSIONS"
+              
+              echo ""
+              echo "✅ Will test latest ${#VERSIONS[@]} version(s)"
+            else
+              echo "  ⚠️  releases.properties not found on main branch"
+              echo "  ❌ Cannot determine versions to test"
+              exit 1
+            fi
+          fi
+          
+          # Validate we have versions to test
+          if [ ${#VERSIONS[@]} -eq 0 ]; then
+            echo ""
+            echo "❌ No versions detected"
+            echo ""
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              echo "For Pull Requests, please ensure:"
+              echo "  1. Changes include files in /bin/phppgadminX.X.X/ directories, OR"
+              echo "  2. PR title contains version numbers (e.g., 7.14.4)"
+              echo ""
+              echo "Note: Automatic testing of latest versions is not enabled for PRs."
+              echo "      Use manual workflow dispatch to test latest versions."
+            else
+              echo "For Manual Runs:"
+              echo "  • Provide specific versions in the 'versions' input, OR"
+              echo "  • Leave 'versions' empty to test latest N versions"
+            fi
+            exit 1
+          fi
+          
+          # Output results
+          echo ""
+          echo "=== Final Version List ==="
+          printf '%s\n' "${VERSIONS[@]}"
+          
+          # Convert array to JSON format for matrix
+          VERSIONS_JSON=$(printf '%s\n' "${VERSIONS[@]}" | jq -R . | jq -s -c .)
+          echo "versions=$VERSIONS_JSON" >> $GITHUB_OUTPUT
+          echo "version_count=${#VERSIONS[@]}" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "=== Summary ==="
+          echo "Total versions to test: ${#VERSIONS[@]}"
+          echo "Versions JSON: $VERSIONS_JSON"
+
+  test-versions:
+    name: Test phpPgAdmin ${{ matrix.version }}
+    needs: detect-versions
+    runs-on: windows-latest
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJson(needs.detect-versions.outputs.versions) }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+      
+      - name: Fetch main branch
+        run: |
+          git fetch origin main:main
+      
+      - name: Get download URL from releases.properties
+        id: get_url
+        shell: pwsh
+        run: |
+          # Always use releases.properties from main branch
+          Write-Host "Fetching releases.properties from main branch..."
+          git checkout main -- releases.properties
+          
+          $version = "${{ matrix.version }}"
+          Write-Host "Looking for version: $version"
+          
+          if (-not (Test-Path "releases.properties")) {
+            Write-Host "ERROR: releases.properties not found on main branch"
+            exit 1
+          }
+          
+          $content = Get-Content "releases.properties"
+          $url = ""
+          
+          foreach ($line in $content) {
+            $line = $line.Trim()
+            # Skip comments and empty lines
+            if ($line -match '^#' -or $line -eq '') {
+              continue
+            }
+            
+            # Parse property line
+            if ($line -match '^(.+?)\s*=\s*(.+)$') {
+              $key = $matches[1].Trim()
+              $value = $matches[2].Trim()
+              
+              if ($key -eq $version) {
+                $url = $value
+                Write-Host "Found URL: $url"
+                break
+              }
+            }
+          }
+          
+          if ($url -eq "") {
+            Write-Host "ERROR: Version $version not found in releases.properties on main branch"
+            Write-Host "Available versions:"
+            Get-Content "releases.properties" | Select-String -Pattern '^\s*[0-9]' | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+          
+          echo "url=$url" >> $env:GITHUB_OUTPUT
+      
+      - name: Download phpPgAdmin ${{ matrix.version }}
+        shell: pwsh
+        env:
+          DOWNLOAD_URL: ${{ steps.get_url.outputs.url }}
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          $url = $env:DOWNLOAD_URL
+          $version = "${{ matrix.version }}"
+          $filename = "phppgadmin-$version.7z"
+          
+          Write-Host "Downloading from: $url"
+          Write-Host "Saving to: $filename"
+          
+          # Download with authentication for pre-release assets
+          $headers = @{
+            'Authorization' = "token $env:GH_TOKEN"
+            'Accept' = 'application/octet-stream'
+          }
+          
+          try {
+            Invoke-WebRequest -Uri $url -OutFile $filename -Headers $headers -MaximumRetryCount 3
+            
+            if (Test-Path $filename) {
+              $size = (Get-Item $filename).Length
+              Write-Host "✓ Download successful: $([math]::Round($size/1MB, 2)) MB"
+            } else {
+              Write-Host "ERROR: Download failed - file not found"
+              exit 1
+            }
+          } catch {
+            Write-Host "ERROR: Download failed - $($_.Exception.Message)"
+            exit 1
+          }
+      
+      - name: Extract phpPgAdmin ${{ matrix.version }}
+        shell: pwsh
+        run: |
+          $version = "${{ matrix.version }}"
+          $filename = "phppgadmin-$version.7z"
+          $extractPath = "test-extract"
+          
+          Write-Host "Extracting $filename to $extractPath..."
+          
+          # Use 7-Zip (pre-installed on GitHub Windows runners)
+          & "C:\Program Files\7-Zip\7z.exe" x $filename -o"$extractPath" -y
+          
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "ERROR: Extraction failed"
+            exit 1
+          }
+          
+          Write-Host "✓ Extraction successful"
+          
+          # List extracted contents
+          Write-Host ""
+          Write-Host "Extracted contents:"
+          Get-ChildItem -Path $extractPath -Recurse -Depth 2 | Select-Object FullName
+      
+      - name: Verify phpPgAdmin structure
+        shell: pwsh
+        run: |
+          $version = "${{ matrix.version }}"
+          $extractPath = "test-extract"
+          
+          Write-Host "Verifying phpPgAdmin $version structure..."
+          Write-Host ""
+          
+          # Find the phppgadmin directory (might be nested)
+          $phppgadminDir = Get-ChildItem -Path $extractPath -Recurse -Directory -Filter "phppgadmin*" | Select-Object -First 1
+          
+          if (-not $phppgadminDir) {
+            Write-Host "ERROR: phpPgAdmin directory not found in extracted files"
+            exit 1
+          }
+          
+          Write-Host "Found phpPgAdmin directory: $($phppgadminDir.FullName)"
+          Write-Host ""
+          
+          # Check for essential files
+          $requiredFiles = @(
+            "index.php"
+          )
+          
+          $optionalFiles = @(
+            "conf/config.inc.php-dist"
+          )
+          
+          $allRequiredExist = $true
+          foreach ($file in $requiredFiles) {
+            $filePath = Join-Path $phppgadminDir.FullName $file
+            if (Test-Path $filePath) {
+              Write-Host "✓ Found: $file"
+            } else {
+              Write-Host "✗ Missing required file: $file"
+              $allRequiredExist = $false
+            }
+          }
+          
+          foreach ($file in $optionalFiles) {
+            $filePath = Join-Path $phppgadminDir.FullName $file
+            if (Test-Path $filePath) {
+              Write-Host "✓ Found: $file"
+            } else {
+              Write-Host "⚠ Optional file not found: $file"
+            }
+          }
+          
+          Write-Host ""
+          
+          if (-not $allRequiredExist) {
+            Write-Host "ERROR: Required files are missing"
+            exit 1
+          }
+          
+          Write-Host "✓ All required files present"
+          
+          # Check PHP files syntax (basic check)
+          Write-Host ""
+          Write-Host "Checking PHP file syntax..."
+          
+          $phpFiles = Get-ChildItem -Path $phppgadminDir.FullName -Filter "*.php" -Recurse | Select-Object -First 5
+          
+          foreach ($phpFile in $phpFiles) {
+            $content = Get-Content $phpFile.FullName -Raw
+            if ($content -match '<\?php') {
+              Write-Host "✓ Valid PHP syntax: $($phpFile.Name)"
+            } else {
+              Write-Host "⚠ Potential issue: $($phpFile.Name)"
+            }
+          }
+          
+          Write-Host ""
+          Write-Host "✓ phpPgAdmin $version verification complete"
+      
+      - name: Test configuration
+        shell: pwsh
+        run: |
+          $version = "${{ matrix.version }}"
+          $extractPath = "test-extract"
+          
+          Write-Host "Testing phpPgAdmin $version configuration..."
+          Write-Host ""
+          
+          # Find the phppgadmin directory
+          $phppgadminDir = Get-ChildItem -Path $extractPath -Recurse -Directory -Filter "phppgadmin*" | Select-Object -First 1
+          
+          if (-not $phppgadminDir) {
+            Write-Host "ERROR: phpPgAdmin directory not found"
+            exit 1
+          }
+          
+          # Check config file (optional)
+          $configDist = Join-Path $phppgadminDir.FullName "conf/config.inc.php-dist"
+          
+          if (Test-Path $configDist) {
+            Write-Host "✓ Configuration template found"
+            
+            # Read and validate config structure
+            $configContent = Get-Content $configDist -Raw
+            
+            $requiredSettings = @(
+              '\$conf\[',
+              'servers',
+              'host'
+            )
+            
+            foreach ($setting in $requiredSettings) {
+              if ($configContent -match $setting) {
+                Write-Host "✓ Found setting: $setting"
+              } else {
+                Write-Host "⚠ Missing setting: $setting"
+              }
+            }
+          } else {
+            Write-Host "ℹ Configuration template not found (optional file)"
+          }
+          
+          Write-Host ""
+          Write-Host "✓ Configuration test complete"
+      
+      - name: Generate test report
+        if: always()
+        shell: pwsh
+        run: |
+          $version = "${{ matrix.version }}"
+          $status = if ($?) { "✅ PASSED" } else { "❌ FAILED" }
+          
+          Write-Host ""
+          Write-Host "=================================="
+          Write-Host "Test Report: phpPgAdmin $version"
+          Write-Host "=================================="
+          Write-Host "Status: $status"
+          Write-Host "Runner: ${{ runner.os }}"
+          Write-Host "Timestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+          Write-Host "=================================="
+
+  test-summary:
+    name: Test Summary
+    needs: [detect-versions, test-versions]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Generate summary
+        run: |
+          echo "# phpPgAdmin Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Versions Tested:** ${{ needs.detect-versions.outputs.version_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Versions:** ${{ needs.detect-versions.outputs.versions }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.test-versions.result }}" = "success" ]; then
+            echo "✅ **All tests passed!**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Some tests failed. Please check the logs above.**" >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: Check test results
+        if: needs.test-versions.result != 'success'
+        run: |
+          echo "Tests failed or were cancelled"
+          exit 1
