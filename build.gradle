@@ -115,27 +115,39 @@ def resolveDownloadUrl(String version) {
         }
     }
     
-    // Fallback to phpPgAdmin GitHub latest release source archive
-    return resolveGitHubSourceUrl()
+    // Fallback to an exact-version tag archive on GitHub
+    return resolveGitHubTagUrl(version)
 }
 
-// Helper function to resolve the latest phpPgAdmin release source.zip from GitHub
-def resolveGitHubSourceUrl() {
-    def latestUrl = "https://api.github.com/repos/ReimuHakurei/phpPgAdmin/releases/latest"
-    try {
-        def connection = new URL(latestUrl).openConnection()
-        connection.setRequestProperty("User-Agent", "Bearsampp-Gradle-Build")
-        connection.setConnectTimeout(10000)
-        connection.setReadTimeout(10000)
-        def release = new groovy.json.JsonSlurper().parse(connection.inputStream)
-        if (release.tag_name) {
-            return "https://github.com/ReimuHakurei/phpPgAdmin/archive/refs/tags/${release.tag_name}.zip"
-        }
-    } catch (Exception e) {
-        logger.warn("Could not fetch phpPgAdmin latest release info: ${e.message}")
+// Helper function to resolve a phpPgAdmin source archive for an exact version
+// tag on GitHub. Fails the build if no exact tag exists instead of
+// substituting moving source (latest/master) under the requested version.
+def resolveGitHubTagUrl(String version) {
+    def candidateTags = [version]
+    if (!version.startsWith('v')) {
+        candidateTags.add("v${version}")
     }
-    // Last-resort fallback to the master branch source archive
-    return "https://github.com/ReimuHakurei/phpPgAdmin/archive/refs/heads/master.zip"
+
+    for (String tag : candidateTags) {
+        try {
+            def connection = new URL("https://api.github.com/repos/ReimuHakurei/phpPgAdmin/git/refs/tags/${tag}").openConnection()
+            connection.setRequestProperty("User-Agent", "Bearsampp-Gradle-Build")
+            connection.setConnectTimeout(10000)
+            connection.setReadTimeout(10000)
+            connection.connect()
+            if (connection.responseCode >= 200 && connection.responseCode < 300) {
+                return "https://github.com/ReimuHakurei/phpPgAdmin/archive/refs/tags/${tag}.zip"
+            }
+            connection.errorStream?.close()
+        } catch (Exception e) {
+            logger.warn("Could not resolve phpPgAdmin tag '${tag}': ${e.message}")
+        }
+    }
+
+    throw new GradleException(
+        "No download URL found for phpPgAdmin version '${version}'. " +
+        "Add a mapping to releases.properties or use a version that matches an exact tag on " +
+        "https://github.com/ReimuHakurei/phpPgAdmin/tags .")
 }
 
 // Helper function to download and extract phpPgAdmin
@@ -145,24 +157,63 @@ def downloadAndExtractphpPgAdmin(String version, File destDir, String tmpPath) {
     
     def fileName = downloadUrl.substring(downloadUrl.lastIndexOf('/') + 1)
     def downloadFile = file("${bundleTmpDownloadPath}/${fileName}")
+    def tempDownloadFile = file("${bundleTmpDownloadPath}/.${fileName}.tmp")
     
     // Create temp directory
     downloadFile.parentFile.mkdirs()
     
-    // Download if not already present
-    if (!downloadFile.exists()) {
-        println "Downloading phpPgAdmin ${version}..."
-        def connection = new URL(downloadUrl).openConnection()
-        connection.setRequestProperty("User-Agent", "Bearsampp-Gradle-Build")
-        
-        downloadFile.withOutputStream { out ->
-            connection.inputStream.withCloseable { input ->
-                out << input
-            }
-        }
-        println "Downloaded: ${downloadFile.name}"
-    } else {
+    // Reuse a valid cached download; discard and re-download anything that looks incomplete
+    if (downloadFile.exists() && isDownloadedArchiveValid(downloadFile)) {
         println "Using cached download: ${downloadFile.name}"
+    } else {
+        if (downloadFile.exists()) {
+            println "Discarding incomplete cached download: ${downloadFile.name}"
+            downloadFile.delete()
+        }
+        
+        println "Downloading phpPgAdmin ${version}..."
+        try {
+            // Download to a temporary file so an interrupted transfer never
+            // leaves a partial archive at the final cache path
+            def connection = new URL(downloadUrl).openConnection()
+            connection.setRequestProperty("User-Agent", "Bearsampp-Gradle-Build")
+            connection.setConnectTimeout(10000)
+            connection.setReadTimeout(30000)
+            
+            long expectedSize = connection.contentLength
+            long downloadedSize = 0L
+            tempDownloadFile.withOutputStream { out ->
+                connection.inputStream.withCloseable { input ->
+                    def buffer = new byte[8192]
+                    int bytesRead
+                    while ((bytesRead = input.read(buffer)) != -1) {
+                        out.write(buffer, 0, bytesRead)
+                        downloadedSize += bytesRead
+                    }
+                }
+            }
+            
+            // Validate successful completion before publishing to the cache
+            if (downloadedSize == 0L) {
+                throw new GradleException("Downloaded file is empty: ${fileName}")
+            }
+            if (expectedSize >= 0L && downloadedSize != expectedSize) {
+                throw new GradleException("Incomplete download for ${fileName}: received ${downloadedSize} of ${expectedSize} bytes")
+            }
+            if (!isDownloadedArchiveValid(tempDownloadFile)) {
+                throw new GradleException("Downloaded file failed validation: ${fileName}")
+            }
+            
+            // Atomically move the completed download into the cache
+            if (!tempDownloadFile.renameTo(downloadFile)) {
+                throw new GradleException("Failed to move downloaded file into cache: ${fileName}")
+            }
+            println "Downloaded: ${downloadFile.name}"
+        } catch (Exception e) {
+            // Never leave a partial file behind on failure
+            tempDownloadFile.delete()
+            throw e
+        }
     }
     
     // Extract archive
@@ -204,6 +255,39 @@ def downloadAndExtractphpPgAdmin(String version, File destDir, String tmpPath) {
     }
     
     println "phpPgAdmin ${version} prepared successfully"
+}
+
+// Helper function to validate a downloaded/cached archive before use.
+// Archives with known formats (zip, 7z, gzip) are checked against their
+// magic bytes; anything else is accepted as long as it is non-empty.
+def isDownloadedArchiveValid(File file) {
+    if (file == null || !file.exists() || file.length() == 0L) {
+        return false
+    }
+
+    def lowerName = file.name.toLowerCase()
+    if (!(lowerName.endsWith('.zip') || lowerName.endsWith('.7z') || lowerName.endsWith('.gz') || lowerName.endsWith('.tgz'))) {
+        return true
+    }
+
+    def bytes = new byte[6]
+    file.withInputStream { stream ->
+        stream.read(bytes)
+    }
+
+    // ZIP: 'PK' followed by 0x03 (local file header) or 0x05 (empty archive)
+    if (bytes[0] == 0x50 && bytes[1] == 0x4B && (bytes[2] == 0x03 || bytes[2] == 0x05)) {
+        return true
+    }
+    // 7z: 37 7A BC AF 27 1C
+    if (bytes[0] == 0x37 && bytes[1] == 0x7A && bytes[2] == (byte)0xBC && bytes[3] == (byte)0xAF && bytes[4] == 0x27 && bytes[5] == 0x1C) {
+        return true
+    }
+    // gzip: 1F 8B
+    if (bytes[0] == 0x1F && bytes[1] == (byte)0x8B) {
+        return true
+    }
+    return false
 }
 
 // ============================================================================
@@ -383,130 +467,137 @@ tasks.register('release') {
             println "Selected version: ${versionToBuild}"
         }
 
-        println ""
-        println "=".multiply(70)
-        println "Building release for ${bundleName} version ${versionToBuild}"
-        println "=".multiply(70)
-        println ""
-
-        // Check if version folder exists - check both bin and bin/archived directories
-        def bundlePath = file("${projectDir}/bin/${bundleName}${versionToBuild}")
-        if (!bundlePath.exists()) {
-            bundlePath = file("${projectDir}/bin/archived/${bundleName}${versionToBuild}")
-            if (!bundlePath.exists()) {
-                def availableVersions = getAvailableVersions()
-                def versionList = availableVersions.isEmpty() ? "  (none found)" : availableVersions.collect { "  - ${it}" }.join('\n')
-                
-                throw new GradleException("Bundle version not found in bin/ or bin/archived/\n\nAvailable versions:\n${versionList}")
-            }
-        }
-
-        println "Bundle path: ${bundlePath}"
-        println ""
-
-        // Get the bundle folder and version
-        def bundleFolder = bundlePath.name
-        def bundleVersion = bundleFolder.replace(bundleName, '')
-
-        // Prepare output directory
-        def phpPgAdminPrepPath = file("${bundleTmpPrepPath}/${bundleName}${bundleVersion}")
-        if (phpPgAdminPrepPath.exists()) {
-            delete phpPgAdminPrepPath
-        }
-        phpPgAdminPrepPath.mkdirs()
-
-        // Download and extract phpPgAdmin
-        println "Downloading and extracting phpPgAdmin ${bundleVersion}..."
-        downloadAndExtractphpPgAdmin(bundleVersion, phpPgAdminPrepPath, buildTmpPath)
-        println ""
-
-        // Copy configuration files from bin folder
-        println "Copying configuration files..."
-        copy {
-            from bundlePath
-            into phpPgAdminPrepPath
-        }
-        println ""
-
-        // Copy to bundles_build directory (non-zip version for development/testing)
-        println "Copying to bundles_build directory..."
-        def phpPgAdminBuildPath = file("${bundleTmpBuildPath}/${bundleName}${bundleVersion}")
-        if (phpPgAdminBuildPath.exists()) {
-            delete phpPgAdminBuildPath
-        }
-        phpPgAdminBuildPath.mkdirs()
-
-        copy {
-            from phpPgAdminPrepPath
-            into phpPgAdminBuildPath
-        }
-        println "Non-zip version available at: ${phpPgAdminBuildPath}"
-
-        println ""
-        println "Preparing archive..."
-
-        // Determine build output path following Apache pattern
-        // bearsampp-build/apps/phpPgAdmin/{bundleRelease} for apps
-        def buildPath = file(buildBasePath)
-        def buildBinsPath = file("${buildPath}/${bundleType}/${bundleName}/${bundleRelease}")
-        buildBinsPath.mkdirs()
-
-        // Build archive filename
-        def destFile = file("${buildBinsPath}/bearsampp-${bundleName}-${bundleVersion}-${bundleRelease}")
-        def archiveFile = file("${destFile}.${bundleFormat}")
-
-        if (archiveFile.exists()) {
-            delete archiveFile
-        }
-
-        println "Compressing ${bundleName}${bundleVersion} to ${archiveFile.name}..."
-
-        def sevenZip = find7ZipExecutable()
-        if (!sevenZip) {
-            throw new GradleException("7-Zip not found. Please install 7-Zip or set 7Z_HOME environment variable.")
-        }
-
-        println "Using 7-Zip: ${sevenZip}"
-
-        // Create archive with version folder included
-        // Run 7z from the parent directory and add the folder name, so the
-        // archive root contains `${bundleName}${bundleVersion}` directory.
-        def folderName = phpPgAdminPrepPath.name
-        def command = [
-            sevenZip,
-            'a',
-            '-t7z',
-            archiveFile.absolutePath.toString(),
-            folderName
-        ]
-
-        def process = new ProcessBuilder(command as String[])
-            .directory(file(bundleTmpPrepPath))
-            .redirectErrorStream(true)
-            .start()
-
-        process.inputStream.eachLine { line ->
-            if (line.trim()) println "  ${line}"
-        }
-
-        def exitCode = process.waitFor()
-        if (exitCode != 0) {
-            throw new GradleException("7zip compression failed with exit code: ${exitCode}")
-        }
-
-        println "Archive created: ${archiveFile}"
-
-        // Generate hash files
-        println "Generating hash files..."
-        generateHashFiles(archiveFile)
-
-        println ""
-        println "=".multiply(70)
-        println "[SUCCESS] Release build completed successfully for version ${versionToBuild}"
-        println "Output directory: ${phpPgAdminBuildPath}"
-        println "Archive: ${archiveFile}"
-        println "=".multiply(70)
+        // Build this version via the shared implementation
+        buildRelease(versionToBuild)
     }
+}
+
+// Helper function to build a release for a specific version.
+// Shared by the 'release' and 'releaseAll' tasks.
+def buildRelease(String version) {
+    println ""
+    println "=".multiply(70)
+    println "Building release for ${bundleName} version ${version}"
+    println "=".multiply(70)
+    println ""
+
+    // Check if version folder exists - check both bin and bin/archived directories
+    def bundlePath = file("${projectDir}/bin/${bundleName}${version}")
+    if (!bundlePath.exists()) {
+        bundlePath = file("${projectDir}/bin/archived/${bundleName}${version}")
+        if (!bundlePath.exists()) {
+            def availableVersions = getAvailableVersions()
+            def versionList = availableVersions.isEmpty() ? "  (none found)" : availableVersions.collect { "  - ${it}" }.join('\n')
+            
+            throw new GradleException("Bundle version not found in bin/ or bin/archived/\n\nAvailable versions:\n${versionList}")
+        }
+    }
+
+    println "Bundle path: ${bundlePath}"
+    println ""
+
+    // Get the bundle folder and version
+    def bundleFolder = bundlePath.name
+    def bundleVersion = bundleFolder.replace(bundleName, '')
+
+    // Prepare output directory
+    def phpPgAdminPrepPath = file("${bundleTmpPrepPath}/${bundleName}${bundleVersion}")
+    if (phpPgAdminPrepPath.exists()) {
+        delete phpPgAdminPrepPath
+    }
+    phpPgAdminPrepPath.mkdirs()
+
+    // Download and extract phpPgAdmin
+    println "Downloading and extracting phpPgAdmin ${bundleVersion}..."
+    downloadAndExtractphpPgAdmin(bundleVersion, phpPgAdminPrepPath, buildTmpPath)
+    println ""
+
+    // Copy configuration files from bin folder
+    println "Copying configuration files..."
+    copy {
+        from bundlePath
+        into phpPgAdminPrepPath
+    }
+    println ""
+
+    // Copy to bundles_build directory (non-zip version for development/testing)
+    println "Copying to bundles_build directory..."
+    def phpPgAdminBuildPath = file("${bundleTmpBuildPath}/${bundleName}${bundleVersion}")
+    if (phpPgAdminBuildPath.exists()) {
+        delete phpPgAdminBuildPath
+    }
+    phpPgAdminBuildPath.mkdirs()
+
+    copy {
+        from phpPgAdminPrepPath
+        into phpPgAdminBuildPath
+    }
+    println "Non-zip version available at: ${phpPgAdminBuildPath}"
+
+    println ""
+    println "Preparing archive..."
+
+    // Determine build output path following Apache pattern
+    // bearsampp-build/apps/phpPgAdmin/{bundleRelease} for apps
+    def buildPath = file(buildBasePath)
+    def buildBinsPath = file("${buildPath}/${bundleType}/${bundleName}/${bundleRelease}")
+    buildBinsPath.mkdirs()
+
+    // Build archive filename
+    def destFile = file("${buildBinsPath}/bearsampp-${bundleName}-${bundleVersion}-${bundleRelease}")
+    def archiveFile = file("${destFile}.${bundleFormat}")
+
+    if (archiveFile.exists()) {
+        delete archiveFile
+    }
+
+    println "Compressing ${bundleName}${bundleVersion} to ${archiveFile.name}..."
+
+    def sevenZip = find7ZipExecutable()
+    if (!sevenZip) {
+        throw new GradleException("7-Zip not found. Please install 7-Zip or set 7Z_HOME environment variable.")
+    }
+
+    println "Using 7-Zip: ${sevenZip}"
+
+    // Create archive with version folder included
+    // Run 7z from the parent directory and add the folder name, so the
+    // archive root contains `${bundleName}${bundleVersion}` directory.
+    def folderName = phpPgAdminPrepPath.name
+    def command = [
+        sevenZip,
+        'a',
+        '-t7z',
+        archiveFile.absolutePath.toString(),
+        folderName
+    ]
+
+    def process = new ProcessBuilder(command as String[])
+        .directory(file(bundleTmpPrepPath))
+        .redirectErrorStream(true)
+        .start()
+
+    process.inputStream.eachLine { line ->
+        if (line.trim()) println "  ${line}"
+    }
+
+    def exitCode = process.waitFor()
+    if (exitCode != 0) {
+        throw new GradleException("7zip compression failed with exit code: ${exitCode}")
+    }
+
+    println "Archive created: ${archiveFile}"
+
+    // Generate hash files
+    println "Generating hash files..."
+    generateHashFiles(archiveFile)
+
+    println ""
+    println "=".multiply(70)
+    println "[SUCCESS] Release build completed successfully for version ${version}"
+    println "Output directory: ${phpPgAdminBuildPath}"
+    println "Archive: ${archiveFile}"
+    println "=".multiply(70)
 }
 
 // Helper function to find 7-Zip executable
@@ -649,11 +740,8 @@ tasks.register('releaseAll') {
             println "=".multiply(70)
 
             try {
-                // Call release task for this version
-                project.ext.bundleVersion = version
-                tasks.getByName('release').actions.each { action ->
-                    action.execute(tasks.getByName('release'))
-                }
+                // Build this version via the shared implementation
+                buildRelease(version)
 
                 println ""
                 println "[SUCCESS] ${bundleName} ${version} completed"
@@ -960,7 +1048,7 @@ tasks.register('checkModulesUntouched') {
             println "Version Resolution Strategy:"
             println "  1. Check modules-untouched phppgadmin.properties (remote)"
             println "  2. Check releases.properties (local)"
-            println "  3. Resolve phpPgAdmin GitHub latest release source.zip (fallback)"
+            println "  3. Resolve an exact phpPgAdmin version tag on GitHub (fallback)"
 
         } else {
             println ""
@@ -975,7 +1063,7 @@ tasks.register('checkModulesUntouched') {
             println ""
             println "The build system will fall back to:"
             println "  1. releases.properties (local)"
-            println "  2. phpPgAdmin GitHub latest release source.zip"
+            println "  2. Resolve an exact phpPgAdmin version tag on GitHub"
         }
     }
 }
