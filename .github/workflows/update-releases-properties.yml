@@ -1,38 +1,117 @@
 name: Update Releases Properties
 
 # This workflow runs in individual module repositories (e.g., module-php)
-# It automatically updates releases.properties file when a release is published
+# It updates releases.properties when a PR is opened, a release is published/edited, or run manually.
+#
+# PR trigger: auto-detects the latest prerelease from the repo's releases.
+# Release trigger: uses the published/edited release tag directly.
+# Manual trigger: requires release_tag and branch inputs.
+#
+# TEST RE-RUN CONTRACT:
+#   Updating the PR branch (git push) is what makes the module test workflows
+#   re-run (via the PR "synchronize" event). We only push when releases.properties
+#   actually changed (has_changes == true), so a test re-run happens ONLY when:
+#     - a NEW prerelease is published  (new <version> = <url> entry added), or
+#     - an EXISTING prerelease's .7z files are added/changed (URL updated).
+#   Cosmetic edits (title/notes only) leave releases.properties unchanged and
+#   therefore do NOT re-run the tests.
 
 on:
-  release:
-    types: [released, prereleased, edited]
+  pull_request:
+    types: [opened]
 
-  # Manual trigger for testing
+  release:
+    types: [published, edited]
+
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Release tag to process (e.g., 2025.10.31)'
+        description: 'Release tag to process (e.g., php-2025.10.31)'
         required: true
+      branch:
+        description: 'Branch to commit changes to'
+        required: true
+
+concurrency:
+  group: update-releases-${{ github.head_ref || github.event.inputs.branch || github.event.release.target_commitish || 'default' }}
+  cancel-in-progress: false
 
 jobs:
   update-properties:
     runs-on: ubuntu-latest
-    # Skip execution if running in .settings repository
-    if: ${{ !endsWith(github.repository, '.settings') }}
+    if: "!endsWith(github.repository, '.settings')"
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
+      # ---------------------------------------------------------------------
+      # Resolve WHICH prerelease to read and WHICH branch to update.
+      #
+      # The module workflow is: create a version branch (e.g. 9.7.2) + PR,
+      # build + upload a prerelease (e.g. 2026.8.27), then merge. releases.properties
+      # must be updated ON that branch so branch module tests (mysql/mariadb-test)
+      # can download the new version. Ordering is not guaranteed: the PR may be
+      # opened before or after the prerelease is published, so both triggers are
+      # idempotent and defer gracefully instead of failing.
+      # ---------------------------------------------------------------------
+      - name: Resolve release tag and branch
+        id: resolve
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BRANCH="${{ github.head_ref }}"
+            # Auto-detect the latest prerelease. If none exists yet (the
+            # prerelease-before-merge is usually created after the PR), do NOT
+            # fail — defer to the release event, which will update this branch.
+            RELEASE_TAG=$(curl -sf -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases?per_page=10" \
+              | python3 -c "
+          import sys, json
+          for r in json.load(sys.stdin):
+              if r.get('prerelease'):
+                  print(r['tag_name']); break
+          ")
+            if [[ -z "$RELEASE_TAG" ]]; then
+              echo "skip=true" >> $GITHUB_OUTPUT
+              echo "::notice::No prerelease published yet; the release event will update this branch once 2026.*.* is published."
+              echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          elif [[ "${{ github.event_name }}" == "release" ]]; then
+            RELEASE_TAG="${{ github.event.release.tag_name }}"
+            # The release has the data but no branch. If a version PR is open,
+            # push the update to its branch so branch tests see the new version;
+            # otherwise fall back to main.
+            BRANCH=$(curl -sf -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/pulls?state=open&per_page=100" \
+              | python3 -c "
+          import sys, json
+          for pr in json.load(sys.stdin):
+              if pr['head']['ref'] != 'main':
+                  print(pr['head']['ref']); break
+          ")
+            BRANCH="${BRANCH:-main}"
+          else
+            RELEASE_TAG="${{ github.event.inputs.release_tag }}"
+            BRANCH="${{ github.event.inputs.branch }}"
+          fi
+
+          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "Release tag: $RELEASE_TAG"
+          echo "Branch: $BRANCH"
+
       - name: Checkout repository
+        if: steps.resolve.outputs.skip != 'true'
         uses: actions/checkout@v6
         with:
           token: ${{ secrets.GH_PAT }}
+          ref: ${{ steps.resolve.outputs.branch }}
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
+          python-version: '3.13'
 
       - name: Install dependencies
         run: |
@@ -63,9 +142,10 @@ jobs:
           echo "Module name: ${MODULE_NAME}"
 
       - name: Update releases properties
+        if: steps.resolve.outputs.skip != 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ github.event.release.tag_name || github.event.inputs.release_tag }}
+          RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
           REPO_OWNER: ${{ github.repository_owner }}
           REPO_NAME: ${{ github.event.repository.name }}
           MODULE_NAME: ${{ steps.extract_module.outputs.module_name }}
@@ -122,19 +202,29 @@ jobs:
           for asset in release_data.get('assets', []):
               filename = asset['name']
 
-              # Check if file ends with .7z
-              if filename.endswith('.7z'):
+              # Check if file ends with .7z or .7z.exe
+              if filename.endswith('.7z') or filename.endswith('.7z.exe'):
                   download_url = asset['browser_download_url']
 
-                  # Extract version number after filename prefix (e.g., "bearsampp-apache-2.4.66-2025.12.8.7z" -> "2.4.66")
-                  # Pattern: filename_prefix followed by version, then either a dash+date or .7z
-                  # Supports: 18.1, 17.2.3, 3.2.1.0, 17.0-RC1, 2.4.62
-                  # The lookahead ensures we stop before a date pattern or .7z extension
+                  version_match = None
+
+                  # All modules use bearsampp-prefix format (e.g., "bearsampp-apache-2.4.66-2025.12.8.7z" -> "2.4.66")
+                  # Optional (?:-\d+)? handles revision-style versions like "bearsampp-ruby-4.0.6-1-2026.8.9.7z" -> "4.0.6-1"
+                  # Optional (?:-(?:RC|beta|alpha|dev)\d*)? preserves prerelease suffixes in the key (e.g., "bearsampp-mariadb-13.0.1-RC-2026.8.23.7z" -> "13.0.1-RC")
+                  # Legacy: also handle PortableGit format for older Git releases
                   version_match = re.search(
-                      rf'{filename_prefix}-(\d+\.\d+(?:\.\d+)?(?:\.\d+)?(?:-(?:RC|beta|alpha|dev)\d*)?)(?=-20\d{{2}}\.\d{{1,2}}\.\d{{1,2}}|\.7z|$)',
+                      rf'{filename_prefix}-(\d+\.\d+(?:\.\d+)?(?:\.\d+)?(?:-\d+)?(?:-(?:RC|beta|alpha|dev)\d*)?)(?=-20\d{{2}}\.\d{{1,2}}\.\d{{1,2}}|\.7z|$)',
                       filename,
                       re.IGNORECASE
                   )
+                  if not version_match and module_name.lower() == 'git':
+                      # Fallback: legacy PortableGit format (e.g., "PortableGit-2.55.0.2-64-bit.7z.exe" -> "2.55.0.2")
+                      version_match = re.search(
+                          r'PortableGit-(\d+\.\d+(?:\.\d+)*)(?=-(?:\d+-)?bit|\.7z)',
+                          filename,
+                          re.IGNORECASE
+                      )
+
                   if version_match:
                       ver = version_match.group(1)
                       assets.append({
@@ -147,7 +237,8 @@ jobs:
                       print(f"Warning: Could not extract version from: {filename}")
                       # Debug: print the filename for troubleshooting
                       print(f"  Filename: {filename}")
-                      print(f"  Looking for prefix: {filename_prefix}")
+                      if module_name.lower() == 'git':
+                          print(f"  Expected PortableGit format")
 
           if not assets:
               print(f"No .7z assets found in release")
@@ -183,21 +274,31 @@ jobs:
 
           # Fix malformed version entries by re-extracting correct versions from URLs
           # This handles cases like "2025.7.2.7" or "18.1-2025" that should be "18.1"
+          # NOTE: Existing entries are never removed — releases.properties is the complete history.
+          # Stale/404 URLs are kept because the asset may still exist under a different URL
+          # (e.g. re-hosted under a newer release or on the website's bin/archived/ path).
           fixed_properties = OrderedDict()
           for key, url in properties.items():
               # Try to extract the correct version from the URL
               # URL format: .../bearsampp-apache-2.4.66-2025.12.8.7z (for apache)
               # URL format: .../bearsampp-postgresql-18.1-2025.12.8.7z (for other modules)
+              # URL format: .../PortableGit-2.55.0.2-64-bit.7z.exe (for Git)
               url_version_match = re.search(
-                  rf'{filename_prefix}-(\d+\.\d+(?:\.\d+)?(?:\.\d+)?(?:-(?:RC|beta|alpha|dev)\d*)?)(?=-20\d{{2}}\.\d{{1,2}}\.\d{{1,2}}|\.7z|/|$)',
+                  rf'{filename_prefix}-(\d+\.\d+(?:\.\d+)?(?:\.\d+)?(?:-\d+)?(?:-(?:RC|beta|alpha|dev)\d*)?)(?=-20\d{{2}}\.\d{{1,2}}\.\d{{1,2}}|\.7z|/|$)',
                   url,
                   re.IGNORECASE
               )
+              if not url_version_match and module_name.lower() == 'git':
+                  url_version_match = re.search(
+                      r'PortableGit-(\d+\.\d+(?:\.\d+)*)(?=-(?:\d+-)?bit|\.7z)',
+                      url,
+                      re.IGNORECASE
+                  )
 
               if url_version_match:
                   correct_version = url_version_match.group(1)
-                  # If the key is malformed (date-like or has trailing year), fix it
-                  if re.match(r'^20\d{2}\.', key) or re.search(r'-20\d{2}$', key):
+                  # If the key is malformed (date-like or has trailing year or has -64 suffix), fix it
+                  if re.match(r'^20\d{2}\.', key) or re.search(r'-20\d{2}$', key) or re.search(r'-\d+-bit$', key, re.IGNORECASE):
                       print(f"Fixing malformed entry: {key} -> {correct_version}")
                       fixed_properties[correct_version] = url
                   else:
@@ -208,6 +309,61 @@ jobs:
                   fixed_properties[key] = url
 
           properties = fixed_properties
+
+          # Repair stale URLs by searching all releases for replacement assets.
+          # Old releases sometimes have their assets deleted/reorganized (e.g. assets
+          # moved from 2022.12.03 to 2024.4.20). We search all releases to find a
+          # working URL for any version whose current URL returns 404.
+          print(f"\nChecking for stale URLs and searching for replacements...")
+          version_url_map = {}
+          page = 1
+          while True:
+              releases_api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/releases?per_page=100&page={page}"
+              releases_response = requests.get(releases_api_url, headers=headers)
+              releases_response.raise_for_status()
+              releases_page = releases_response.json()
+              if not releases_page:
+                  break
+              for release in releases_page:
+                  for asset in release.get('assets', []):
+                      asset_name = asset['name']
+                      if not (asset_name.endswith('.7z') or asset_name.endswith('.7z.exe')):
+                          continue
+                      m = re.search(
+                          rf'{filename_prefix}-(\d+\.\d+(?:\.\d+)?(?:\.\d+)?(?:-\d+)?(?:-(?:RC|beta|alpha|dev)\d*)?)(?=-20\d{{2}}\.\d{{1,2}}\.\d{{1,2}}|\.7z|$)',
+                          asset_name, re.IGNORECASE
+                      )
+                      if not m and module_name.lower() == 'git':
+                          m = re.search(r'PortableGit-(\d+\.\d+(?:\.\d+)*)(?=-(?:\d+-)?bit|\.7z)', asset_name, re.IGNORECASE)
+                      if m:
+                          ver = m.group(1)
+                          if ver not in version_url_map:
+                              version_url_map[ver] = asset['browser_download_url']
+              if len(releases_page) < 100:
+                  break
+              page += 1
+
+          print(f"Found {len(version_url_map)} versions across all releases")
+
+          repaired_entries = 0
+          for key, url in list(properties.items()):
+              try:
+                  response = requests.head(url, timeout=10, allow_redirects=True)
+                  if response.status_code == 404 and key in version_url_map:
+                      new_url = version_url_map[key]
+                      if new_url != url:
+                          print(f"Repairing stale URL: {key}")
+                          print(f"  Old: {url}")
+                          print(f"  New: {new_url}")
+                          properties[key] = new_url
+                          repaired_entries += 1
+              except requests.exceptions.RequestException:
+                  pass
+
+          if repaired_entries > 0:
+              print(f"\nRepaired {repaired_entries} stale URLs")
+          else:
+              print(f"\nNo stale URLs needed repair")
 
           # Add new versions
           for asset in assets:
@@ -255,48 +411,68 @@ jobs:
 
           EOF
 
-      - name: Create Pull Request
-        id: create_pr
-        uses: peter-evans/create-pull-request@v7
-        with:
-          token: ${{ secrets.GH_PAT }}
-          base: main
-          commit-message: |
-            Update releases.properties
-
-            Auto-generated from release ${{ github.event.release.tag_name || github.event.inputs.release_tag }}
-          branch: update-releases-${{ github.event.release.tag_name || github.event.inputs.release_tag }}
-          delete-branch: true
-          title: 'Update releases.properties from release ${{ github.event.release.tag_name || github.event.inputs.release_tag }}'
-          body: |
-            ## 🤖 Automated Releases Properties Update
-
-            This PR updates the `releases.properties` file with new versions from release `${{ github.event.release.tag_name || github.event.inputs.release_tag }}`.
-
-            ### Changes:
-            - Extracted .7z assets from the release
-            - Added version entries with download URLs
-            - Maintained semver ordering (newest first)
-
-            **Release URL:** ${{ github.event.release.html_url || format('https://github.com/{0}/{1}/releases/tag/{2}', github.repository_owner, github.event.repository.name, github.event.inputs.release_tag) }}
-
-            ### Next Steps:
-            1. ⏳ Link validation will run automatically
-            2. ✅ Once validation passes, this PR will auto-merge
-            3. ❌ If validation fails, please review and fix invalid URLs
-          labels: |
-            automated
-            releases-update
-
-      - name: Wait for validation checks
-        if: steps.create_pr.outputs.pull-request-number != ''
+      - name: Check for changes
+        id: check_changes
+        if: steps.resolve.outputs.skip != 'true'
         run: |
-          echo "Waiting for link validation to complete..."
-          sleep 10
+          if git diff --quiet releases.properties 2>/dev/null; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No changes to releases.properties"
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "Changes detected in releases.properties"
+          fi
 
-      - name: Enable auto-merge
-        if: steps.create_pr.outputs.pull-request-number != ''
-        run: |
-          gh pr merge ${{ steps.create_pr.outputs.pull-request-number }} --auto --squash
+      - name: Commit and push changes
+        # Commit on every event that produced changes. Pushes to the resolved
+        # branch (the version PR branch) so branch tests see the new entry, and
+        # mirrors to main so main stays consistent for the final release.
+        if: >
+          steps.resolve.outputs.skip != 'true' &&
+          steps.check_changes.outputs.has_changes == 'true'
         env:
+          RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
+          BRANCH: ${{ steps.resolve.outputs.branch }}
           GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          git config user.name "Bearsampp Bot"
+          git config user.email "bot@bearsampp.com"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git add releases.properties
+          git commit -m "Update releases.properties
+
+          Auto-generated from release ${RELEASE_TAG}"
+          git push origin HEAD:${BRANCH}
+
+          # Also update main branch directly without a PR
+          if [[ "${BRANCH}" != "main" ]]; then
+            COMMIT_SHA=$(git rev-parse HEAD)
+            git fetch origin main
+            git checkout main
+            if git cherry-pick --no-edit $COMMIT_SHA; then
+              git push origin main
+            else
+              echo "::warning::Cherry-pick to main failed, skipping main sync"
+              git cherry-pick --abort 2>/dev/null || true
+            fi
+            git checkout ${BRANCH} || true
+          fi
+
+  dispatch:
+    runs-on: ubuntu-latest
+    needs: [update-properties]
+    # Only a published release should tell Bearsampp to combine releases. The
+    # PR trigger merely updates the branch for tests and must not fire this.
+    if: |
+      always() &&
+      github.event_name != 'pull_request' &&
+      !endsWith(github.repository, '.settings') &&
+      needs.update-properties.result == 'success'
+    steps:
+      - name: Invoke workflow in another repo (Quickpick Dispatcher)
+        uses: peter-evans/repository-dispatch@v4
+        with:
+          token: ${{ secrets.Gh_PAT }}
+          repository: Bearsampp/Bearsampp
+          event-type: module_release_created
+          client-payload: '{"workflow": "combine_releases.yml"}'
