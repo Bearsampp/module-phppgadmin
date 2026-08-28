@@ -78,7 +78,7 @@ repositories {
 
 // Helper function to fetch modules-untouched properties
 def fetchModulesUntouchedProperties() {
-    def propsUrl = "https://raw.githubusercontent.com/Bearsampp/modules-untouched/main/modules/phpPgAdmin.properties"
+    def propsUrl = "https://raw.githubusercontent.com/Bearsampp/modules-untouched/main/modules/phppgadmin.properties"
     
     try {
         def connection = new URL(propsUrl).openConnection()
@@ -115,8 +115,27 @@ def resolveDownloadUrl(String version) {
         }
     }
     
-    // Fallback to standard URL format
-    return "https://files.phpPgAdmin.net/phpPgAdmin/${version}/phpPgAdmin-${version}-zip"
+    // Fallback to phpPgAdmin GitHub latest release source archive
+    return resolveGitHubSourceUrl()
+}
+
+// Helper function to resolve the latest phpPgAdmin release source.zip from GitHub
+def resolveGitHubSourceUrl() {
+    def latestUrl = "https://api.github.com/repos/ReimuHakurei/phpPgAdmin/releases/latest"
+    try {
+        def connection = new URL(latestUrl).openConnection()
+        connection.setRequestProperty("User-Agent", "Bearsampp-Gradle-Build")
+        connection.setConnectTimeout(10000)
+        connection.setReadTimeout(10000)
+        def release = new groovy.json.JsonSlurper().parse(connection.inputStream)
+        if (release.tag_name) {
+            return "https://github.com/ReimuHakurei/phpPgAdmin/archive/refs/tags/${release.tag_name}.zip"
+        }
+    } catch (Exception e) {
+        logger.warn("Could not fetch phpPgAdmin latest release info: ${e.message}")
+    }
+    // Last-resort fallback to the master branch source archive
+    return "https://github.com/ReimuHakurei/phpPgAdmin/archive/refs/heads/master.zip"
 }
 
 // Helper function to download and extract phpPgAdmin
@@ -782,16 +801,16 @@ tasks.register('verify') {
     }
 }
 
-// Task: List all bundle versions from modules-untouched phpPgAdmin.properties
+// Task: List all bundle versions from modules-untouched phppgadmin.properties
 tasks.register('listReleases') {
     group = 'help'
-    description = 'List all available releases from modules-untouched phpPgAdmin.properties'
+    description = 'List all available releases from modules-untouched phppgadmin.properties'
 
     doLast {
         def props = fetchModulesUntouchedProperties()
         if (!props) {
-            println "\n[WARNING] Could not fetch modules-untouched phpPgAdmin.properties."
-            println "Checking releases.properties instead..."
+println "\n[WARNING] Could not fetch modules-untouched phppgadmin.properties."
+        println "Checking releases.properties instead..."
             
             def releasesFile = file('releases.properties')
             if (releasesFile.exists()) {
@@ -896,12 +915,12 @@ tasks.register('checkModulesUntouched') {
         println "=".multiply(70)
         println ""
 
-        def propsUrl = "https://raw.githubusercontent.com/Bearsampp/modules-untouched/main/modules/phpPgAdmin.properties"
+        def propsUrl = "https://raw.githubusercontent.com/Bearsampp/modules-untouched/main/modules/phppgadmin.properties"
         println "Repository URL:"
         println "  ${propsUrl}"
         println ""
 
-        println "Fetching phpPgAdmin.properties from modules-untouched..."
+        println "Fetching phppgadmin.properties from modules-untouched..."
         def untouchedProps = fetchModulesUntouchedProperties()
 
         if (untouchedProps) {
@@ -939,14 +958,14 @@ tasks.register('checkModulesUntouched') {
             println "=".multiply(70)
             println ""
             println "Version Resolution Strategy:"
-            println "  1. Check modules-untouched phpPgAdmin.properties (remote)"
+            println "  1. Check modules-untouched phppgadmin.properties (remote)"
             println "  2. Check releases.properties (local)"
-            println "  3. Construct standard URL format (fallback)"
+            println "  3. Resolve phpPgAdmin GitHub latest release source.zip (fallback)"
 
         } else {
             println ""
             println "=".multiply(70)
-            println "[WARNING] Could not fetch phpPgAdmin.properties from modules-untouched"
+            println "[WARNING] Could not fetch phppgadmin.properties from modules-untouched"
             println "=".multiply(70)
             println ""
             println "This may be due to:"
@@ -956,7 +975,7 @@ tasks.register('checkModulesUntouched') {
             println ""
             println "The build system will fall back to:"
             println "  1. releases.properties (local)"
-            println "  2. Standard URL format construction"
+            println "  2. phpPgAdmin GitHub latest release source.zip"
         }
     }
 }

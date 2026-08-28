@@ -284,7 +284,7 @@ bearsampp-build/apps/phpPgAdmin/2025.10.31/
 
 The build system resolves download URLs in the following order:
 
-1. **modules-untouched** - Remote phpPgAdmin.properties from GitHub
+1. **modules-untouched** - Remote phppgadmin.properties from GitHub
 2. **releases.properties** - Local fallback file
 3. **Standard URL format** - Constructed URL as last resort
 
